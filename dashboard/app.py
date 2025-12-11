@@ -3,6 +3,7 @@ import os
 import streamlit as st
 import httpx
 from datetime import datetime
+from urllib.parse import quote_plus
 
 API_URL = os.getenv('API_URL', 'http://localhost:8000')
 
@@ -15,6 +16,8 @@ if 'user_id' not in st.session_state:
     st.session_state.user_id = None
 if 'user_email' not in st.session_state:
     st.session_state.user_email = None
+if 'user_name' not in st.session_state:
+    st.session_state.user_name = None
 if 'user_role' not in st.session_state:
     st.session_state.user_role = None
 if 'page' not in st.session_state:
@@ -178,9 +181,7 @@ def page_signup():
     with col2:
         st.markdown("""
         <div style="text-align: center; margin-top: 1rem;">
-            <p>Already have an account? 
-            <a href="#" onclick="document.querySelector('[data-testid=stButton] button:contains(\"Log in\")').click()">
-            <strong style="color: #0066cc;">Log in here</strong></a></p>
+            <p>Already have an account?</p>
         </div>
         """, unsafe_allow_html=True)
         
@@ -370,6 +371,22 @@ def page_login():
                             st.session_state.user_id = data["user_id"]
                             st.session_state.user_email = email
                             st.session_state.user_role = data["role"]
+
+                            # Fetch full user info (name, verified email/role)
+                            try:
+                                me_resp = httpx.get(
+                                    f"{API_URL}/auth/me",
+                                    headers=get_auth_header(),
+                                    timeout=10
+                                )
+                                me_resp.raise_for_status()
+                                me = me_resp.json()
+                                st.session_state.user_name = me.get("name") or None
+                                st.session_state.user_email = me.get("email") or email
+                                st.session_state.user_role = me.get("role") or data["role"]
+                            except Exception:
+                                # Fallback name from email prefix
+                                st.session_state.user_name = (email.split("@")[0].replace(".", " ").title() if email else None)
                             
                             st.success("✅ Logged in successfully!")
                             st.balloons()
@@ -389,7 +406,7 @@ def page_login():
         st.markdown("---")
         st.markdown("""
         <div class="auth-footer">
-            <p>Don't have an account? <a href="#">Create one now</a></p>
+            <p>Don't have an account?</p>
         </div>
         """, unsafe_allow_html=True)
         
@@ -405,13 +422,40 @@ def page_dashboard():
     
     # Sidebar: user info and logout
     with st.sidebar:
-        st.write(f"👤 **{st.session_state.user_email}**")
-        st.write(f"Role: `{st.session_state.user_role}`")
+        # Ensure name is loaded if token exists
+        if st.session_state.token and not st.session_state.get("user_name"):
+            try:
+                me_resp = httpx.get(
+                    f"{API_URL}/auth/me",
+                    headers=get_auth_header(),
+                    timeout=10
+                )
+                me_resp.raise_for_status()
+                me = me_resp.json()
+                st.session_state.user_name = me.get("name") or None
+                st.session_state.user_email = me.get("email") or st.session_state.user_email
+                st.session_state.user_role = me.get("role") or st.session_state.user_role
+            except Exception:
+                pass
+
+        display_name = st.session_state.get("user_name") or (st.session_state.get("user_email") or "").split("@")[0].replace(".", " ").title()
+        avatar_url = f"https://ui-avatars.com/api/?name={quote_plus(display_name)}&background=667eea&color=fff&size=128&rounded=true"
+
+        pc1, pc2 = st.columns([1, 3])
+        with pc1:
+            st.image(avatar_url, width=48)
+        with pc2:
+            st.markdown(f"**{display_name}**")
+            if st.session_state.user_email:
+                st.caption(f"📧 {st.session_state.user_email}")
+            if st.session_state.user_role:
+                st.caption(f"🛡️ Role: `{st.session_state.user_role}`")
         
         if st.button("🚪 Log Out", use_container_width=True):
             st.session_state.token = None
             st.session_state.user_id = None
             st.session_state.user_email = None
+            st.session_state.user_name = None
             st.session_state.user_role = None
             st.session_state.page = 'login'
             st.rerun()
@@ -419,7 +463,7 @@ def page_dashboard():
         st.divider()
         
         # Tabs for project creation methods
-        tab1, tab2 = st.tabs(["GitHub URL", "Upload ZIP"])
+        tab1, tab2 = st.tabs(["🔗 GitHub URL", "📤 Upload ZIP"])
         
         with tab1:
             st.subheader("GitHub Repository")
@@ -665,6 +709,123 @@ def show_project_details(project_id: str, get_auth_header):
             
             except Exception as e:
                 st.warning(f"Could not load repository metadata: {e}")
+        
+        # Interactive Q&A and Context
+        with st.expander("🧠 Interactive Q&A and Context", expanded=False):
+            qa_col, ctx_col = st.columns(2)
+            with qa_col:
+                st.write("Ask about current analysis or codebase")
+                q = st.text_input("Your question", placeholder="What are you analyzing right now?")
+                if st.button("Ask", key="ask_btn", use_container_width=True):
+                    if not q.strip():
+                        st.warning("Enter a question")
+                    else:
+                        try:
+                            ans_resp = httpx.post(
+                                f"{API_URL}/analysis/{project_id}/ask",
+                                headers=get_auth_header(),
+                                json={"question": q},
+                                timeout=20
+                            )
+                            if ans_resp.status_code in (200, 202):
+                                ans = ans_resp.json()
+                                if ans_resp.status_code == 202:
+                                    st.info(ans.get("detail") or "Analysis in progress")
+                                else:
+                                    st.success(ans.get("answer", ""))
+                                    cits = ans.get("citations", [])
+                                    if cits:
+                                        with st.expander("Citations"):
+                                            for c in cits:
+                                                st.code(f"{c.get('file_path')}:{c.get('start_line')}")
+                            else:
+                                st.error(ans_resp.text)
+                        except Exception as e:
+                            st.error(f"Ask failed: {e}")
+            with ctx_col:
+                st.write("Add guidance to influence analysis")
+                instruction = st.text_area("Instruction", placeholder="Focus more on the payment module")
+                priority = st.selectbox("Priority", options=["normal", "high"], index=0)
+                if st.button("Add Context", key="ctx_btn", use_container_width=True):
+                    if not instruction.strip():
+                        st.warning("Enter an instruction")
+                    else:
+                        try:
+                            ctx_resp = httpx.post(
+                                f"{API_URL}/analysis/{project_id}/context",
+                                headers=get_auth_header(),
+                                json={"instruction": instruction, "priority": priority},
+                                timeout=10
+                            )
+                            ctx_resp.raise_for_status()
+                            st.success("Context added")
+                        except Exception as e:
+                            st.error(f"Add context failed: {e}")
+        
+        # Visual Diagrams and Export
+        with st.expander("📈 Visual Diagrams & Export", expanded=False):
+            d_cols = st.columns(2)
+            with d_cols[0]:
+                if st.button("Load Diagrams", use_container_width=True):
+                    try:
+                        d_resp = httpx.get(
+                            f"{API_URL}/analysis/{project_id}/diagrams",
+                            headers=get_auth_header(),
+                            timeout=15
+                        )
+                        d_resp.raise_for_status()
+                        diagrams = d_resp.json()
+                        for title, code in diagrams.items():
+                            st.write(f"**{title.title()} Diagram**")
+                            st.markdown("```mermaid\n" + code.strip() + "\n```")
+                    except Exception as e:
+                        st.error(f"Load diagrams failed: {e}")
+            with d_cols[1]:
+                e1, e2 = st.columns(2)
+                with e1:
+                    if st.button("Export Markdown", use_container_width=True):
+                        try:
+                            ex = httpx.get(
+                                f"{API_URL}/analysis/{project_id}/export",
+                                params={"format": "md"},
+                                headers=get_auth_header(),
+                                timeout=20
+                            )
+                            ex.raise_for_status()
+                            payload = ex.json()
+                            content = payload.get("content", "")
+                            st.download_button(
+                                label="Download .md",
+                                data=content.encode("utf-8"),
+                                file_name=f"{project.get('name','project')}_report.md",
+                                mime="text/markdown",
+                                use_container_width=True
+                            )
+                        except Exception as e:
+                            st.error(f"Export failed: {e}")
+                with e2:
+                    if st.button("Export PDF (demo)", use_container_width=True):
+                        try:
+                            ex = httpx.get(
+                                f"{API_URL}/analysis/{project_id}/export",
+                                params={"format": "pdf"},
+                                headers=get_auth_header(),
+                                timeout=20
+                            )
+                            ex.raise_for_status()
+                            payload = ex.json()
+                            st.info(payload.get("note", "PDF export not available"))
+                            content = payload.get("content", "")
+                            if content:
+                                st.download_button(
+                                    label="Download PDF (raw md content)",
+                                    data=content.encode("utf-8"),
+                                    file_name=f"{project.get('name','project')}_report.pdf.txt",
+                                    mime="text/plain",
+                                    use_container_width=True
+                                )
+                        except Exception as e:
+                            st.error(f"Export failed: {e}")
         
         # Persona-Specific Analysis Section
         personas = project.get('personas', [])
@@ -913,4 +1074,3 @@ elif st.session_state.page == 'signup':
     page_signup()
 elif st.session_state.page == 'dashboard':
     page_dashboard()
-

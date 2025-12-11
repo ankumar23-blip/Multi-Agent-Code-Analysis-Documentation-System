@@ -32,6 +32,11 @@ class PersonaAnalyzer:
                 "dependencies": self.metadata.dependencies,
                 "recommendations": self._generate_sde_recommendations(),
                 "key_files": self._get_sde_key_files(),
+                # Added explicit details
+                "tech_stack": self._get_technology_summary(),
+                "languages_detail": self.metadata.languages_detail or {},
+                "important_files": (self.metadata.important_files or [])[:20],
+                "important_files_with_types": (self.metadata.important_files_with_types or [])[:20],
             }
         except Exception as e:
             print(f"[PERSONA] Error generating SDE analysis: {e}")
@@ -62,6 +67,10 @@ class PersonaAnalyzer:
             "recommendations": self._generate_pm_recommendations(),
             "key_files": self._get_pm_key_files(),
             "stakeholders": self._identify_stakeholders(),
+            # Added explicit details
+            "tech_stack": self._get_technology_summary(),
+            "frameworks": self.metadata.frameworks,
+            "important_files": (self.metadata.important_files or [])[:20],
         }
     
     # SDE Analysis Methods
@@ -130,6 +139,9 @@ This is a **{repo_type}** project with the following characteristics:
             },
             "entry_points": self.metadata.entry_points[:5],
             "code_organization": self._analyze_code_organization(),
+            # Added richer signals
+            "languages_detail": self.metadata.languages_detail or {},
+            "extension_counts": self.metadata.extension_counts or {},
         }
     
     def _analyze_code_quality(self) -> Dict[str, Any]:

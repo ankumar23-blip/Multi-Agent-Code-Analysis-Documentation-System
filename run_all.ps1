@@ -10,6 +10,9 @@ if (-not $env:VIRTUAL_ENV) {
     & ".\backend\.venv\Scripts\Activate.ps1"
 }
 
+Write-Host "Ensuring backend dependencies are installed..." -ForegroundColor Cyan
+python -m pip install -q -r backend/requirements.txt
+
 Write-Host "Ensuring dashboard dependencies are installed..." -ForegroundColor Cyan
 python -m pip install -q -r dashboard/requirements.txt
 

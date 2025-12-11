@@ -1,6 +1,8 @@
 import os
 import openai
 import httpx
+from .langfuse_client import track_event
+import time
 
 # Keys
 OPENAI_KEY = os.getenv('OPENAI_API_KEY')
@@ -48,13 +50,25 @@ def call_llm(prompt: str, model: str | None = None, max_tokens: int = 512) -> st
             'temperature': 0.0,
         }
 
+        start = time.time()
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(url, json=data, headers=headers)
             resp.raise_for_status()
             j = resp.json()
 
         # Anthropic responses historically put the text in 'completion', but APIs vary.
-        return j.get('completion') or j.get('output') or j.get('text') or ''
+        out = j.get('completion') or j.get('output') or j.get('text') or ''
+        try:
+            track_event('llm.call', {
+                'provider': 'claude',
+                'model': use_model,
+                'prompt_len': len(prompt),
+                'max_tokens': max_tokens,
+                'duration_ms': int((time.time() - start) * 1000)
+            })
+        except Exception:
+            pass
+        return out
 
     # Fallback to OpenAI (chat/completions) if OpenAI key is available
     if not OPENAI_KEY:
@@ -62,6 +76,7 @@ def call_llm(prompt: str, model: str | None = None, max_tokens: int = 512) -> st
 
     # Use a simple completion call via the OpenAI SDK as a fallback.
     try:
+        start = time.time()
         completion = openai.Completion.create(
             model=use_model,
             prompt=prompt,
@@ -69,16 +84,39 @@ def call_llm(prompt: str, model: str | None = None, max_tokens: int = 512) -> st
             temperature=0.0,
         )
         # completion.choices[0].text is the typical field
-        return completion.choices[0].text if completion.choices else ''
+        out = completion.choices[0].text if completion.choices else ''
+        try:
+            track_event('llm.call', {
+                'provider': 'openai.completion',
+                'model': use_model,
+                'prompt_len': len(prompt),
+                'max_tokens': max_tokens,
+                'duration_ms': int((time.time() - start) * 1000)
+            })
+        except Exception:
+            pass
+        return out
     except Exception:
         # Try chat completion shape if older/newer API is used
+        start = time.time()
         chat = openai.ChatCompletion.create(
             model=use_model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             temperature=0.0,
         )
-        return chat.choices[0].message.content if chat.choices else ''
+        out = chat.choices[0].message.content if chat.choices else ''
+        try:
+            track_event('llm.call', {
+                'provider': 'openai.chat',
+                'model': use_model,
+                'prompt_len': len(prompt),
+                'max_tokens': max_tokens,
+                'duration_ms': int((time.time() - start) * 1000)
+            })
+        except Exception:
+            pass
+        return out
 
 
 def embed_text(text: str) -> list[float]:
@@ -88,4 +126,8 @@ def embed_text(text: str) -> list[float]:
     so the rest of the codebase can continue calling `embed_text(...)`.
     """
     # For now return a fixed-length zero-vector to preserve API shape.
+    try:
+        track_event('llm.embed', {'text_len': len(text)})
+    except Exception:
+        pass
     return [0.0] * 1536

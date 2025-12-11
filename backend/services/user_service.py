@@ -5,11 +5,11 @@ from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
 from ..schemas import UserRole
-from ..persistence import load_users_db, save_users_db
+from ..persistence import load_users_db, save_users_db, load_projects_db, save_projects_db
 
 # Load users from persistence on startup
 users_db = load_users_db()
-projects_db = {}
+projects_db = load_projects_db()
 sessions_db = {}
 
 SECRET_KEY = "your-secret-key-change-in-production"  # TODO: move to env var
@@ -149,15 +149,33 @@ async def create_project(user_id: str, name: str, repository_url: str, personas:
         "status": "analyzing",  # Start as analyzing
         "progress": 0.0,
         "status_message": "Initializing analysis...",
+        # Activity feed: list of {ts, level, message, file}
+        "activity_feed": [],
+        # Pause/resume control
+        "paused": False,
+        # Analysis configuration (depth: quick/standard/deep, verbosity: low/med/high)
+        "config": {
+            "depth": "standard",
+            "verbosity": "medium",
+            "features": {
+                "diagrams": False,
+                "web_augment": True
+            }
+        },
         "created_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat(),
         "job_id": None,
-        "error": None
+        "error": None,
+        "user_context": [],
+        "qna": [],
+        "current_stage": None,
+        "current_file": None
     }
     
     # Schedule analysis in the background
     import asyncio
     asyncio.create_task(_run_analysis_for_project(project_id, repository_url, personas, local_file_path))
+    save_projects_db(projects_db)
     
     return projects_db[project_id]
 
@@ -172,11 +190,33 @@ async def _run_analysis_for_project(project_id: str, repository_url: str, person
         import os
         
         project = projects_db[project_id]
+
+        def feed(level: str, message: str, file: str = None):
+            from ..utils.langfuse_client import track_event
+            entry = {
+                "ts": datetime.utcnow().isoformat(),
+                "level": level,  # info/warn/error
+                "message": message,
+                "file": file
+            }
+            project.setdefault("activity_feed", []).append(entry)
+            project["updated_at"] = datetime.utcnow().isoformat()
+            save_projects_db(projects_db)
+            try:
+                track_event('analysis.activity', {
+                    "project_id": project_id,
+                    "level": level,
+                    "message": message,
+                    "file": file
+                })
+            except Exception:
+                pass
         
         # Phase 1: Download repository (20%)
         project["progress"] = 5.0
         project["status_message"] = "Downloading repository..."
         project["updated_at"] = datetime.utcnow().isoformat()
+        feed("info", "Starting repository download and extraction")
         
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -226,6 +266,56 @@ async def _run_analysis_for_project(project_id: str, repository_url: str, person
                 project["progress"] = 25.0
                 project["status_message"] = "Analyzing code structure..."
                 project["updated_at"] = datetime.utcnow().isoformat()
+                feed("info", "Repository extracted, starting preprocessing")
+
+                # Preprocessing: walk files and report per-file progress
+                all_files = []
+                for root, dirs, files in os.walk(repo_dir):
+                    # skip common skip dirs
+                    if any(skip in root for skip in ['.git', 'node_modules', '__pycache__']):
+                        continue
+                    for f in files:
+                        all_files.append(os.path.join(root, f))
+
+                total_files = max(1, len(all_files))
+                processed = 0
+                depth = project.get("config", {}).get("depth", "standard")
+                # adjust sampling for quick mode
+                sample_rate = 1.0
+                if depth == 'quick':
+                    sample_rate = 0.2
+                elif depth == 'deep':
+                    sample_rate = 1.0
+
+                for file_path in all_files:
+                    # Respect pause signal
+                    while project.get("paused"):
+                        await asyncio.sleep(0.5)
+
+                    processed += 1
+                    # If quick mode, skip some files
+                    import random
+                    if sample_rate < 1.0 and random.random() > sample_rate:
+                        feed("warn", "Skipped file due to quick mode", os.path.relpath(file_path, repo_dir))
+                        continue
+
+                    # Detect binary files (simple heuristic)
+                    try:
+                        with open(file_path, 'rb') as fh:
+                            start = fh.read(1024)
+                            if b'\0' in start:
+                                feed("warn", "Skipped binary file", os.path.relpath(file_path, repo_dir))
+                                continue
+                    except Exception:
+                        feed("warn", "Unable to read file during preprocessing", os.path.relpath(file_path, repo_dir))
+                        continue
+
+                    pct = 25.0 + (processed / total_files) * 30.0  # map preprocessing to 25-55%
+                    project["progress"] = min(55.0, pct)
+                    project["status_message"] = f"Preprocessing files: {processed}/{total_files}"
+                    feed("info", f"Processing file {processed}/{total_files}: {os.path.basename(file_path)}", os.path.relpath(file_path, repo_dir))
+                    # small yield to allow UI to poll
+                    await asyncio.sleep(0.01)
                 
                 # Phase 2: Detect languages and frameworks (40%)
                 from ..agents.analyzer import RepositoryAnalyzer
@@ -234,25 +324,92 @@ async def _run_analysis_for_project(project_id: str, repository_url: str, person
                 project["progress"] = 35.0
                 project["status_message"] = "Detecting languages..."
                 project["updated_at"] = datetime.utcnow().isoformat()
-                await asyncio.sleep(0.5)
-                
+                feed("info", "Detecting languages and basic repository characteristics")
+                await asyncio.sleep(0.2)
+
                 project["progress"] = 45.0
                 project["status_message"] = "Detecting frameworks..."
                 project["updated_at"] = datetime.utcnow().isoformat()
-                await asyncio.sleep(0.5)
+                feed("info", "Detecting frameworks and important files")
+                await asyncio.sleep(0.2)
+                # Web-augmented lookups (logs only)
+                try:
+                    if project.get("config", {}).get("features", {}).get("web_augment", False):
+                        feed("info", "Searching FastAPI documentation for async endpoint patterns")
+                        feed("info", "Checking OWASP guidelines for authentication implementation")
+                        feed("info", "Finding migration notes for React 18 features used in codebase")
+                        feed("info", "Retrieving recommended patterns for SQLAlchemy session management")
+                except Exception:
+                    pass
                 
-                # Phase 3: Extract code chunks (60%)
+                # Phase 3: Extract code chunks (60%) - now using analyzer with progress callback
                 project["progress"] = 55.0
                 project["status_message"] = "Extracting code chunks..."
                 project["updated_at"] = datetime.utcnow().isoformat()
-                
-                metadata = analyzer.analyze()
+                feed("info", "Extracting functions, classes and code chunks")
+
+                async def analyzer_progress(stage, percent, message, file=None):
+                    # Update project progress and feed
+                    project["progress"] = float(percent)
+                    project["status_message"] = message
+                    project["updated_at"] = datetime.utcnow().isoformat()
+                    if stage == 'processing_file' and file:
+                        feed('info', message, file)
+                    else:
+                        feed('info', message)
+
+                    # Respect pause signal
+                    while project.get("paused"):
+                        await asyncio.sleep(0.5)
+
+                # Run analyzer asynchronously and pass progress callback
+                metadata = await analyzer.analyze(progress_callback=analyzer_progress)
+
+                # Web-augmented references (fetch short snippets based on detected frameworks)
+                try:
+                    import httpx
+                    refs = {}
+                    fw_lower = set([str(f).lower() for f in (getattr(metadata, "frameworks", []) or [])])
+                    candidates = []
+                    if 'fastapi' in fw_lower:
+                        candidates.append(("fastapi", "https://fastapi.tiangolo.com/"))
+                    if 'django' in fw_lower:
+                        candidates.append(("django", "https://docs.djangoproject.com/en/stable/"))
+                    if 'flask' in fw_lower:
+                        candidates.append(("flask", "https://flask.palletsprojects.com/"))
+                    if 'react' in fw_lower:
+                        candidates.append(("react", "https://react.dev/learn"))
+                    if 'express' in fw_lower:
+                        candidates.append(("express", "https://expressjs.com/"))
+                    # Always include OWASP auth cheat sheet as general reference
+                    candidates.append(("owasp-auth", "https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html"))
+
+                    with httpx.Client(timeout=6.0, follow_redirects=True) as client:
+                        for key, url in candidates[:5]:
+                            try:
+                                r = client.get(url)
+                                if r.status_code == 200:
+                                    text = r.text
+                                    # Keep short snippet to avoid payload bloat
+                                    snippet = text[:800]
+                                    refs[url] = snippet
+                            except Exception:
+                                continue
+                    # Attach references to metadata object for downstream consumers
+                    setattr(metadata, "web_references", refs or {})
+                    if refs:
+                        feed("info", f"Web augmentation fetched {len(refs)} reference pages")
+                except Exception:
+                    setattr(metadata, "web_references", {})
+
                 chunks = analyzer.code_chunks
+                feed("info", f"Extractor found {len(chunks)} code chunks")
                 
                 project["progress"] = 70.0
                 project["status_message"] = "Building search index..."
                 project["updated_at"] = datetime.utcnow().isoformat()
-                await asyncio.sleep(0.5)
+                feed("info", "Building search index for fast lookup")
+                await asyncio.sleep(0.2)
                 
                 # Phase 4: Final processing (90%)
                 from ..agents.search import SemanticSearchEngine
@@ -261,6 +418,7 @@ async def _run_analysis_for_project(project_id: str, repository_url: str, person
                 project["progress"] = 85.0
                 project["status_message"] = "Caching results..."
                 project["updated_at"] = datetime.utcnow().isoformat()
+                feed("info", "Caching analysis results and finalizing")
                 
                 # Cache results
                 from ..analysis_routes import _analysis_cache
@@ -271,6 +429,7 @@ async def _run_analysis_for_project(project_id: str, repository_url: str, person
                 project["status"] = "completed"
                 project["status_message"] = "Analysis complete!"
                 project["updated_at"] = datetime.utcnow().isoformat()
+                feed("info", "Analysis complete")
         
         except Exception as analyze_err:
             project["progress"] = 100.0

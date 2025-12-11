@@ -174,3 +174,28 @@ async def get_project_handler(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch project: {str(e)}")
+
+
+@router.post("/{project_id}/configure")
+async def configure_project(project_id: str, config: dict, authorization: Optional[str] = Header(None)):
+    """Update analysis configuration for a project (depth, verbosity, features).
+
+    Example body: {"depth":"deep","verbosity":"high","features":{"diagrams":true}}
+    """
+    try:
+        user_id = get_current_user_id(authorization)
+        project = await get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project["owner_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        # Merge config
+        project.setdefault("config", {}).update(config)
+        project["updated_at"] = __import__("datetime").datetime.utcnow().isoformat()
+        project.setdefault("activity_feed", []).append({"ts": __import__("datetime").datetime.utcnow().isoformat(), "level": "info", "message": f"Analysis configuration updated: {config}"})
+        return {"project_id": project_id, "config": project.get("config")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

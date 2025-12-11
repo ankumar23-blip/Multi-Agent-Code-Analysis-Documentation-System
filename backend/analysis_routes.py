@@ -153,9 +153,14 @@ async def get_repo_metadata(
                     
                     print(f"[ANALYSIS] Analyzing repository at: {repo_dir}")
                     
-                    # Run analyzer
+                    # Run analyzer (async, with progress callback for real-time responses)
                     analyzer = RepositoryAnalyzer(repo_dir)
-                    metadata = analyzer.analyze()
+
+                    async def simple_progress(stage, percent, message, file=None):
+                        print(f"[ANALYSIS][PROG] {percent}% {stage} - {message} {file or ''}")
+
+                    import asyncio
+                    metadata = await analyzer.analyze(progress_callback=simple_progress)
                     chunks = analyzer.code_chunks  # Get chunks from analyzer
                     search_engine = SemanticSearchEngine(chunks)
                     
@@ -190,6 +195,322 @@ async def get_repo_metadata(
             # Return error instead of falling back to demo data
             raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
     
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{project_id}/progress")
+async def get_analysis_progress(project_id: str, authorization: Optional[str] = Header(None)):
+    """Return current progress and activity feed for a project."""
+    try:
+        user_id = get_current_user_id(authorization)
+        project = await get_project(project_id)
+
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        if project["owner_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        return {
+            "project_id": project_id,
+            "status": project.get("status"),
+            "progress": project.get("progress", 0.0),
+            "status_message": project.get("status_message", ""),
+            "activity_feed": project.get("activity_feed", [])[-200:]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{project_id}/pause")
+async def pause_analysis(project_id: str, authorization: Optional[str] = Header(None)):
+    try:
+        user_id = get_current_user_id(authorization)
+        project = await get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project["owner_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        project["paused"] = True
+        project.setdefault("activity_feed", []).append({"ts": __import__("datetime").datetime.utcnow().isoformat(), "level": "info", "message": "Analysis paused by user"})
+        return {"project_id": project_id, "paused": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{project_id}/resume")
+async def resume_analysis(project_id: str, authorization: Optional[str] = Header(None)):
+    try:
+        user_id = get_current_user_id(authorization)
+        project = await get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project["owner_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        project["paused"] = False
+        project.setdefault("activity_feed", []).append({"ts": __import__("datetime").datetime.utcnow().isoformat(), "level": "info", "message": "Analysis resumed by user"})
+        return {"project_id": project_id, "paused": False}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{project_id}/ask")
+async def ask_question(
+    project_id: str,
+    body: dict,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Ask questions about the current analysis state.
+    Body: {"question": "...", "persona": "sde|pm" (optional)}
+    """
+    try:
+        user_id = get_current_user_id(authorization)
+        project = await get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project["owner_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        question = (body or {}).get("question", "").strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="Missing 'question'")
+
+        # Ensure analysis has produced cache
+        if project_id not in _analysis_cache:
+            # Answer from current progress if available
+            status = {
+                "status": project.get("status"),
+                "progress": project.get("progress", 0.0),
+                "status_message": project.get("status_message", "")
+            }
+            raise HTTPException(status_code=202, detail=f"Analysis in progress. Current state: {status}")
+
+        metadata, chunks, search_engine = _analysis_cache[project_id]
+        results = search_engine.search(question, limit=5)
+
+        # Compose a concise answer with simple heuristic
+        top_names = [r["name"] for r in results if r.get("name")]
+        answer_lines = []
+        if top_names:
+            answer_lines.append(f"Relevant items: {', '.join(top_names[:5])}")
+        if metadata.frameworks:
+            answer_lines.append(f"Detected frameworks: {', '.join(metadata.frameworks)}")
+        if "framework" in question.lower() or "api" in question.lower():
+            answer_lines.append(f"Repo type: {metadata.repo_type}")
+
+        if not answer_lines:
+            answer_lines.append("No direct match found. Try a more specific query.")
+
+        answer = " ".join(answer_lines)
+        citations = [{"file_path": r["file_path"], "start_line": r["start_line"]} for r in results]
+
+        project.setdefault("qna", []).append({
+            "ts": __import__("datetime").datetime.utcnow().isoformat(),
+            "q": question,
+            "a": answer,
+            "citations": citations
+        })
+        project.setdefault("activity_feed", []).append({
+            "ts": __import__("datetime").datetime.utcnow().isoformat(),
+            "level": "info",
+            "message": f"Answered question: {question}"
+        })
+
+        return {
+            "answer": answer,
+            "citations": citations,
+            "results": results
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{project_id}/context")
+async def add_context(
+    project_id: str,
+    body: dict,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Inject additional information/instructions into analysis.
+    Body: {"instruction": "Focus more on the payment module", "priority": "normal|high" (optional)}
+    """
+    try:
+        user_id = get_current_user_id(authorization)
+        project = await get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project["owner_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        instruction = (body or {}).get("instruction", "").strip()
+        priority = (body or {}).get("priority", "normal")
+        if not instruction:
+            raise HTTPException(status_code=400, detail="Missing 'instruction'")
+
+        ctx = {
+            "ts": __import__("datetime").datetime.utcnow().isoformat(),
+            "instruction": instruction,
+            "priority": priority
+        }
+        project.setdefault("user_context", []).append(ctx)
+        project.setdefault("activity_feed", []).append({
+            "ts": __import__("datetime").datetime.utcnow().isoformat(),
+            "level": "info",
+            "message": f"User context added (priority={priority}): {instruction}"
+        })
+        return {"status": "ok", "context_len": len(project.get("user_context", []))}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{project_id}/diagrams")
+async def get_diagrams(project_id: str, authorization: Optional[str] = Header(None)):
+    """Return multiple Mermaid diagrams derived from analysis."""
+    try:
+        user_id = get_current_user_id(authorization)
+        project = await get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project["owner_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+        if project_id not in _analysis_cache:
+            raise HTTPException(status_code=202, detail="Analysis not yet complete")
+
+        metadata, chunks, _ = _analysis_cache[project_id]
+        total_files = metadata.total_files or 0
+        code_files = metadata.code_files or 0
+
+        architecture = f'''
+flowchart LR
+    A[Users] -->|HTTP| B[Service]
+    B --> C[Business Logic]
+    C --> D[Data Layer]
+    D --> E[(Storage)]
+'''
+        flow = f'''
+flowchart TD
+    start([Start]) --> detect{{Detect Frameworks}}
+    detect -->|Yes| analyze[Analyze Important Files]
+    analyze --> extract[Extract Code Chunks]
+    extract --> end([End])
+    detect -->|No| end
+'''
+        sequence = f'''
+sequenceDiagram
+    participant U as User
+    participant API as API
+    participant S as Analyzer
+    U->>API: Create Project
+    API->>S: Start Analysis
+    S-->>API: Progress Updates
+    API-->>U: Activity Feed + Progress
+'''
+        er = f'''
+erDiagram
+    USER ||--o{{ PROJECT : owns
+    PROJECT ||--o{{ CHUNK : contains
+    USER {{
+      string user_id
+      string email
+    }}
+    PROJECT {{
+      string project_id
+      string name
+      int total_files
+    }}
+    CHUNK {{
+      string file_path
+      string name
+      int start_line
+    }}
+'''
+
+        return {
+            "flowchart": architecture,
+            "flow": flow,
+            "sequence": sequence,
+            "er": er
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{project_id}/export")
+async def export_documentation(project_id: str, format: str = "md", authorization: Optional[str] = Header(None)):
+    """Export complete documentation (Markdown; PDF as placeholder)."""
+    try:
+        user_id = get_current_user_id(authorization)
+        project = await get_project(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project["owner_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+        if project_id not in _analysis_cache:
+            raise HTTPException(status_code=202, detail="Analysis not yet complete")
+
+        metadata, chunks, _ = _analysis_cache[project_id]
+        from .agents.persona_analyzer import PersonaAnalyzer
+        analyzer = PersonaAnalyzer(metadata, chunks)
+        sde = analyzer.analyze_for_sde()
+        pm = analyzer.analyze_for_pm()
+
+        diagrams = await get_diagrams(project_id, authorization=authorization)
+
+        md = []
+        md.append(f"# Project: {project.get('name','')}")
+        md.append("")
+        md.append("## SDE Report")
+        md.append(sde.get("overview",""))
+        md.append("### Architecture")
+        md.append(str(sde.get("architecture", {})))
+        md.append("### Technical Details")
+        md.append(str(sde.get("technical_details", {})))
+        md.append("")
+        md.append("## PM Report")
+        md.append(pm.get("overview",""))
+        md.append("### Features")
+        md.append(str(pm.get("features", {})))
+        md.append("")
+        md.append("## Diagrams (Mermaid)")
+        for title, code in diagrams.items():
+            md.append(f"### {title.title()} Diagram")
+            md.append("```mermaid")
+            md.append(code.strip())
+            md.append("```")
+            md.append("")
+
+        content = "\n".join(md)
+
+        if format.lower() == "md":
+            return {"format": "md", "content": content}
+        elif format.lower() == "pdf":
+            # Placeholder: return Markdown content for now with a note
+            return {
+                "format": "pdf",
+                "note": "PDF generation with rendered Mermaid is not implemented in this demo build.",
+                "content": content
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported format")
     except HTTPException:
         raise
     except Exception as e:
@@ -443,7 +764,7 @@ async def get_persona_analysis(
                     # Run analyzer
                     from .agents.analyzer import RepositoryAnalyzer
                     analyzer = RepositoryAnalyzer(repo_dir)
-                    metadata = analyzer.analyze()
+                    metadata = await analyzer.analyze()
                     chunks = analyzer.code_chunks
                     search_engine = SemanticSearchEngine(chunks)
                     

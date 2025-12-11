@@ -60,7 +60,7 @@ class RepositoryAnalyzer:
         'php': ['.php'],
     }
     
-    # Framework detection patterns
+    # Framework detection patterns (source-code heuristics)
     FRAMEWORK_PATTERNS = {
         'fastapi': ['from fastapi import', 'import fastapi', 'FastAPI()'],
         'django': ['from django', 'import django', 'Django'],
@@ -101,18 +101,39 @@ class RepositoryAnalyzer:
     def __init__(self, repo_path: str):
         self.repo_path = Path(repo_path)
         self.metadata = None
-        self.code_chunks = []
+        self.code_chunks: List[CodeChunk] = []
     
-    def analyze(self) -> RepositoryMetadata:
-        """Analyze repository and extract code chunks."""
+    async def analyze(self, progress_callback=None) -> RepositoryMetadata:
+        """Analyze repository and extract code chunks.
+
+        progress_callback: optional callable accepting (stage:str, percent:float, message:str, file:Optional[str])
+        The callback may be sync or async; this method will await it if it's a coroutine.
+        """
+        import inspect
+
+        async def _maybe_await(cb, *args, **kwargs):
+            if not cb:
+                return None
+            try:
+                result = cb(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+            except Exception:
+                return None
+
         # Detect languages and frameworks
+        await _maybe_await(progress_callback, 'start', 0.0, 'Starting analysis')
         languages = self._detect_languages()
+        await _maybe_await(progress_callback, 'languages_detected', 10.0, f'Languages detected: {languages}')
         repo_type = self._determine_repo_type(languages)
         frameworks = self._detect_frameworks()
+        await _maybe_await(progress_callback, 'frameworks_detected', 20.0, f'Frameworks: {frameworks}')
         
         # Find important files and entry points
         entry_points = self._find_entry_points(repo_type)
         important_files = self._find_important_files(repo_type)
+        await _maybe_await(progress_callback, 'important_files', 30.0, f'Found {len(important_files)} important files')
         
         # Create detailed file info with types
         important_files_with_types = []
@@ -132,22 +153,26 @@ class RepositoryAnalyzer:
         
         # Parse dependencies
         dependencies = self._parse_dependencies(repo_type)
+        await _maybe_await(progress_callback, 'dependencies_parsed', 40.0, f'Parsed dependencies: {len(dependencies)} entries')
         
         # Extract code chunks from important files
-        code_chunks = []
-        for file_path in important_files[:20]:  # Limit to 20 files
+        code_chunks: List[CodeChunk] = []
+        total_imp = max(1, min(len(important_files), 20))
+        for idx, file_path in enumerate(important_files[:20], start=1):
+            await _maybe_await(progress_callback, 'processing_file', 40.0 + (idx / total_imp) * 30.0, f'Processing {file_path}', file_path)
             chunks = self._extract_code_chunks(file_path)
             code_chunks.extend(chunks)
         
         # Extract README / top-level project description
         readme_text = self._extract_readme_text()
+        await _maybe_await(progress_callback, 'readme_parsed', 75.0, 'Extracted README')
 
         # Compute language details and code file counts
         languages_detail = languages or {}
         code_files_count = sum(languages_detail.values()) if languages_detail else 0
 
         # Compute extension counts
-        ext_counts = {}
+        ext_counts: Dict[str, int] = {}
         for f in self.repo_path.rglob('*.*'):
             try:
                 if self._should_skip(f):
@@ -174,13 +199,15 @@ class RepositoryAnalyzer:
             total_code_chunks=len(code_chunks),
             confidence_score=0.85  # Default confidence
         )
+
+        await _maybe_await(progress_callback, 'complete', 100.0, 'Analysis complete')
         
         self.code_chunks = code_chunks
         return self.metadata
     
     def _detect_languages(self) -> Dict[str, int]:
         """Detect languages in repository."""
-        languages = {}
+        languages: Dict[str, int] = {}
 
         # Count files per language by summing counts for all registered extensions
         for lang, exts in self.LANGUAGE_PATTERNS.items():
@@ -234,20 +261,18 @@ class RepositoryAnalyzer:
         """Determine primary repository type."""
         if not languages:
             return 'unknown'
-        
         primary = max(languages.items(), key=lambda x: x[1])[0]
         return primary
     
     def _detect_frameworks(self) -> List[str]:
-        """Detect frameworks used in repository."""
+        """Detect frameworks used in repository using code and dependency heuristics."""
         frameworks = set()
         
-        # Search through important files for framework imports
-        for file_path in self._get_importable_files()[:200]:
+        # Source-code signal
+        for file_path in self._get_importable_files()[:300]:
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
-                    
                     for framework, patterns in self.FRAMEWORK_PATTERNS.items():
                         for pattern in patterns:
                             if pattern.lower() in content.lower():
@@ -256,13 +281,35 @@ class RepositoryAnalyzer:
             except:
                 pass
 
-        # Also inspect top-level config files and README for framework keywords
+        # Dependency signal: requirements.txt / pyproject.toml
         try:
-            readme = self._extract_readme_text() or ''
-            lower_readme = readme.lower()
-            for fw in list(self.FRAMEWORK_PATTERNS.keys()):
-                if fw in lower_readme:
-                    frameworks.add(fw)
+            req = self.repo_path / 'requirements.txt'
+            if req.exists():
+                txt = req.read_text(encoding='utf-8', errors='ignore').lower()
+                if 'fastapi' in txt:
+                    frameworks.add('fastapi')
+                if 'flask' in txt:
+                    frameworks.add('flask')
+                if 'django' in txt:
+                    frameworks.add('django')
+        except:
+            pass
+
+        # Dependency signal: package.json
+        try:
+            pkg = self.repo_path / 'package.json'
+            if pkg.exists():
+                data = json.loads(pkg.read_text(encoding='utf-8', errors='ignore'))
+                deps = {**data.get('dependencies', {}), **data.get('devDependencies', {})}
+                dkeys = ' '.join(deps.keys()).lower()
+                if 'react' in dkeys or 'next' in dkeys:
+                    frameworks.add('react')
+                if 'vue' in dkeys or '@vue' in dkeys:
+                    frameworks.add('vue')
+                if 'angular' in dkeys or '@angular' in dkeys:
+                    frameworks.add('angular')
+                if 'express' in dkeys:
+                    frameworks.add('express')
         except:
             pass
         
@@ -270,21 +317,18 @@ class RepositoryAnalyzer:
     
     def _find_entry_points(self, repo_type: str) -> List[str]:
         """Find entry point files (main.py, index.js, etc.)."""
-        entry_points = []
-        
+        entry_points: List[str] = []
         candidates = self.IMPORTANT_FILES.get(repo_type, [])
-        
         for candidate in candidates:
             matching_files = list(self.repo_path.rglob(candidate))
             for f in matching_files:
                 if not self._should_skip(f):
                     entry_points.append(str(f.relative_to(self.repo_path)))
-        
         return entry_points[:5]  # Limit to top 5
     
     def _find_important_files(self, repo_type: str) -> List[str]:
         """Find important files for analysis."""
-        important = []
+        important: List[str] = []
         
         # Add entry points first
         important.extend(self._find_entry_points(repo_type))
@@ -320,7 +364,7 @@ class RepositoryAnalyzer:
             'pom.xml', 'build.gradle', 'go.mod', 'Cargo.toml', 'tsconfig.json'
         ]
         
-        config_files = []
+        config_files: List[str] = []
         for pattern in config_patterns:
             matches = list(self.repo_path.rglob(pattern))
             for f in matches:
@@ -331,7 +375,7 @@ class RepositoryAnalyzer:
     
     def _parse_dependencies(self, repo_type: str) -> Dict[str, str]:
         """Parse dependencies from config files."""
-        dependencies = {}
+        dependencies: Dict[str, str] = {}
         
         if repo_type == 'python':
             # Parse requirements.txt or pyproject.toml
@@ -343,7 +387,7 @@ class RepositoryAnalyzer:
                             content = f.read()
                             # Simple regex to extract package==version
                             matches = re.findall(r'([a-zA-Z0-9_-]+)\s*==\s*([0-9.]+)', content)
-                            for pkg, ver in matches[:10]:  # Limit to 10
+                            for pkg, ver in matches[:20]:  # Limit to 20
                                 dependencies[pkg] = ver
                     except:
                         pass
@@ -353,10 +397,11 @@ class RepositoryAnalyzer:
             pkg_json = self.repo_path / 'package.json'
             if pkg_json.exists():
                 try:
-                    with open(pkg_json, 'r') as f:
+                    with open(pkg_json, 'r', encoding='utf-8', errors='ignore') as f:
                         data = json.load(f)
                         deps = data.get('dependencies', {})
-                        dependencies.update({k: v for k, v in list(deps.items())[:10]})
+                        for k, v in list(deps.items())[:20]:
+                            dependencies[k] = v
                 except:
                     pass
         
@@ -386,7 +431,7 @@ class RepositoryAnalyzer:
         if not language:
             return []
         
-        chunks = []
+        chunks: List[CodeChunk] = []
         
         # Python code chunking
         if language == 'python':
@@ -414,50 +459,55 @@ class RepositoryAnalyzer:
         return chunks
     
     def _chunk_python(self, file_path: str, content: str) -> List[CodeChunk]:
-        """Chunk Python code into functions and classes."""
-        chunks = []
+        """Chunk Python code into functions and classes.
+
+        Implementation builds proper CodeChunk objects only (no interim dicts),
+        preventing 'dict' object has no attribute 'name' errors down the line.
+        """
+        chunks: List[CodeChunk] = []
         lines = content.split('\n')
         
-        # Simple regex-based function/class detection
-        func_pattern = r'^def\s+(\w+)\s*\('
-        class_pattern = r'^class\s+(\w+)\s*[:\(]'
+        # Regex-based function/class detection (allow indentation)
+        func_re = re.compile(r'^\s*def\s+(\w+)\s*\(')
+        class_re = re.compile(r'^\s*class\s+(\w+)\s*[:\(]')
         
-        current_chunk = None
-        
+        starts: List[Tuple[int, str, str]] = []  # (start_line, name, chunk_type)
         for i, line in enumerate(lines, 1):
-            func_match = re.match(func_pattern, line)
-            class_match = re.match(class_pattern, line)
-            
-            if func_match or class_match:
-                # Save previous chunk
-                if current_chunk:
-                    chunks.append(current_chunk)
-                
-                # Create new chunk
-                chunk_type = 'function' if func_match else 'class'
-                name = func_match.group(1) if func_match else class_match.group(1)
-                
-                current_chunk = {
-                    'type': chunk_type,
-                    'name': name,
-                    'start': i,
-                    'content_start': i - 1
-                }
+            m_func = func_re.match(line)
+            m_class = class_re.match(line)
+            if m_func or m_class:
+                name = m_func.group(1) if m_func else m_class.group(1)
+                ctype = 'function' if m_func else 'class'
+                starts.append((i, name, ctype))
         
-        # Finalize chunks
-        if current_chunk:
-            current_chunk['end'] = len(lines)
-            
+        if starts:
+            for idx, (start_line, name, ctype) in enumerate(starts):
+                end_line = (starts[idx + 1][0] - 1) if idx + 1 < len(starts) else len(lines)
+                end_line = max(start_line, end_line)
+                chunk = CodeChunk(
+                    chunk_id=f"{file_path}:{start_line}",
+                    file_path=file_path,
+                    chunk_type=ctype,
+                    name=name,
+                    start_line=start_line,
+                    end_line=end_line,
+                    language='python',
+                    content='\n'.join(lines[start_line - 1:end_line])[:2000],
+                    metadata={'extracted': True}
+                )
+                chunks.append(chunk)
+        else:
+            # if no identifiable symbols, provide the file as a chunk
             chunk = CodeChunk(
-                chunk_id=f"{file_path}:{current_chunk['start']}",
+                chunk_id=f"{file_path}:0",
                 file_path=file_path,
-                chunk_type=current_chunk['type'],
-                name=current_chunk['name'],
-                start_line=current_chunk['start'],
-                end_line=current_chunk['end'],
+                chunk_type='file',
+                name=Path(file_path).name,
+                start_line=0,
+                end_line=len(lines),
                 language='python',
-                content='\n'.join(lines[current_chunk['content_start']:current_chunk['end']])[:2000],
-                metadata={'extracted': True}
+                content=content[:2000],
+                metadata={'type': 'whole_file'}
             )
             chunks.append(chunk)
         
@@ -465,7 +515,7 @@ class RepositoryAnalyzer:
     
     def _chunk_javascript(self, file_path: str, content: str) -> List[CodeChunk]:
         """Chunk JavaScript/TypeScript code."""
-        chunks = []
+        chunks: List[CodeChunk] = []
         lines = content.split('\n')
         
         # Simple function/class detection
@@ -497,19 +547,15 @@ class RepositoryAnalyzer:
     
     def _get_importable_files(self) -> List[str]:
         """Get all code files that should be analyzed."""
-        files = []
-        
+        files: List[str] = []
         for ext, _ in [(ext, lang) for lang, exts in self.LANGUAGE_PATTERNS.items() for ext in exts]:
             files.extend([str(f) for f in self.repo_path.rglob(f'*{ext}') if not self._should_skip(f)])
-        
         return files
     
     def _should_skip(self, file_path: Path) -> bool:
         """Check if file should be skipped."""
         path_str = str(file_path)
-        
         for skip_pattern in self.SKIP_PATTERNS:
             if skip_pattern in path_str:
                 return True
-        
         return False
