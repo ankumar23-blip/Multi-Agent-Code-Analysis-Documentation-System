@@ -32,6 +32,17 @@ def get_auth_header():
         return {"Authorization": f"Bearer {st.session_state.token}"}
     return {}
 
+def logout_and_redirect(msg: str = "Session expired. Please log in again."):
+    """Clear session and redirect to login with a message."""
+    st.warning(msg)
+    st.session_state.token = None
+    st.session_state.user_id = None
+    st.session_state.user_email = None
+    st.session_state.user_name = None
+    st.session_state.user_role = None
+    st.session_state.page = 'login'
+    st.rerun()
+
 
 # ============ Auth Pages ============
 
@@ -435,6 +446,11 @@ def page_dashboard():
                 st.session_state.user_name = me.get("name") or None
                 st.session_state.user_email = me.get("email") or st.session_state.user_email
                 st.session_state.user_role = me.get("role") or st.session_state.user_role
+            except httpx.HTTPError as e:
+                if hasattr(e, "response") and e.response is not None and e.response.status_code == 401:
+                    logout_and_redirect("Session expired. Please log in again.")
+                else:
+                    pass
             except Exception:
                 pass
 
@@ -488,25 +504,29 @@ def page_dashboard():
                     if not project_name or not repo_url:
                         st.error("Project name and repository URL are required")
                     else:
-                        try:
-                            resp = httpx.post(
-                                f"{API_URL}/projects/",
-                                json={
-                                    "name": project_name,
-                                    "repository_url": repo_url,
-                                    "personas": personas,
-                                    "description": description
-                                },
-                                headers=get_auth_header(),
-                                timeout=10
-                            )
-                            resp.raise_for_status()
-                            data = resp.json()
-                            st.success(f"✓ Project created! Starting analysis...")
-                            st.rerun()
-                        except httpx.HTTPError as e:
-                            error_detail = e.response.text if hasattr(e, 'response') else str(e)
-                            st.error(f"Failed to create project: {error_detail}")
+                            try:
+                                with st.spinner("Creating project and starting analysis..."):
+                                    resp = httpx.post(
+                                        f"{API_URL}/projects/",
+                                        json={
+                                            "name": project_name,
+                                            "repository_url": repo_url,
+                                            "personas": personas,
+                                            "description": description
+                                        },
+                                        headers=get_auth_header(),
+                                        timeout=10
+                                    )
+                                resp.raise_for_status()
+                                data = resp.json()
+                                st.success(f"✓ Project created! Starting analysis...")
+                                st.rerun()
+                            except httpx.HTTPError as e:
+                                if hasattr(e, "response") and e.response is not None and e.response.status_code == 401:
+                                    logout_and_redirect("Session expired. Please log in again.")
+                                else:
+                                    error_detail = e.response.text if hasattr(e, 'response') else str(e)
+                                    st.error(f"Failed to create project: {error_detail}")
         
         with tab2:
             st.subheader("Upload ZIP File")
@@ -527,23 +547,27 @@ def page_dashboard():
                         st.error("ZIP file and project name are required")
                     else:
                         try:
-                            resp = httpx.post(
-                                f"{API_URL}/projects/upload",
-                                files={"file": (zip_file.name, zip_file.getvalue(), "application/zip")},
-                                headers={
-                                    **get_auth_header(),
-                                    "name": upload_project_name,
-                                    "personas": ",".join(upload_personas)
-                                },
-                                timeout=30
-                            )
+                            with st.spinner("Uploading file and starting analysis..."):
+                                resp = httpx.post(
+                                    f"{API_URL}/projects/upload",
+                                    files={"file": (zip_file.name, zip_file.getvalue(), "application/zip")},
+                                    headers={
+                                        **get_auth_header(),
+                                        "name": upload_project_name,
+                                        "personas": ",".join(upload_personas)
+                                    },
+                                    timeout=30
+                                )
                             resp.raise_for_status()
                             data = resp.json()
                             st.success(f"✓ Project created! Analysis starting...")
                             st.rerun()
                         except httpx.HTTPError as e:
-                            error_detail = e.response.text if hasattr(e, 'response') else str(e)
-                            st.error(f"Upload failed: {error_detail}")
+                            if hasattr(e, "response") and e.response is not None and e.response.status_code == 401:
+                                logout_and_redirect("Session expired. Please log in again.")
+                            else:
+                                error_detail = e.response.text if hasattr(e, 'response') else str(e)
+                                st.error(f"Upload failed: {error_detail}")
     
     # Check if viewing project details
     if st.session_state.selected_project:
@@ -567,11 +591,12 @@ def show_projects_list(get_auth_header):
     any_analyzing = False
     
     try:
-        resp = httpx.get(
-            f"{API_URL}/projects/",
-            headers=get_auth_header(),
-            timeout=10
-        )
+        with st.spinner("Loading projects..."):
+            resp = httpx.get(
+                f"{API_URL}/projects/",
+                headers=get_auth_header(),
+                timeout=10
+            )
         resp.raise_for_status()
         projects = resp.json()
         
@@ -627,31 +652,42 @@ def show_projects_list(get_auth_header):
                 st.rerun()
     
     except httpx.HTTPError as e:
-        st.error(f"Failed to load projects: {e}")
+        if hasattr(e, "response") and e.response is not None and e.response.status_code == 401:
+            logout_and_redirect("Session expired. Please log in again.")
+        else:
+            st.error(f"Failed to load projects: {e}")
 
 
 def show_project_details(project_id: str, get_auth_header):
     """Show detailed analysis for a project."""
     try:
         # Get project info
-        project_resp = httpx.get(
-            f"{API_URL}/projects/{project_id}",
-            headers=get_auth_header(),
-            timeout=10
-        )
+        with st.spinner("Loading project details..."):
+            project_resp = httpx.get(
+                f"{API_URL}/projects/{project_id}",
+                headers=get_auth_header(),
+                timeout=10
+            )
         project_resp.raise_for_status()
         project = project_resp.json()
         
         st.title(f"📊 {project['name']}")
         
+        # Show origin info (GitHub or uploaded ZIP filename)
+        repo = project.get('repository_url') or ''
+        if isinstance(repo, str) and repo.startswith('Uploaded ZIP:'):
+            uploaded_name = repo.split(':', 1)[1].strip()
+            st.info(f"📦 Uploaded ZIP: {uploaded_name}")
+        
         # Repository Intelligence Section
         with st.expander("🔍 Repository Intelligence", expanded=True):
             try:
-                meta_resp = httpx.get(
-                    f"{API_URL}/analysis/{project_id}/metadata",
-                    headers=get_auth_header(),
-                    timeout=10
-                )
+                with st.spinner("Loading repository intelligence..."):
+                    meta_resp = httpx.get(
+                        f"{API_URL}/analysis/{project_id}/metadata",
+                        headers=get_auth_header(),
+                        timeout=10
+                    )
                 meta_resp.raise_for_status()
                 metadata = meta_resp.json()
                 
@@ -721,12 +757,13 @@ def show_project_details(project_id: str, get_auth_header):
                         st.warning("Enter a question")
                     else:
                         try:
-                            ans_resp = httpx.post(
-                                f"{API_URL}/analysis/{project_id}/ask",
-                                headers=get_auth_header(),
-                                json={"question": q},
-                                timeout=20
-                            )
+                            with st.spinner("Getting answer..."):
+                                ans_resp = httpx.post(
+                                    f"{API_URL}/analysis/{project_id}/ask",
+                                    headers=get_auth_header(),
+                                    json={"question": q},
+                                    timeout=20
+                                )
                             if ans_resp.status_code in (200, 202):
                                 ans = ans_resp.json()
                                 if ans_resp.status_code == 202:
@@ -738,8 +775,15 @@ def show_project_details(project_id: str, get_auth_header):
                                         with st.expander("Citations"):
                                             for c in cits:
                                                 st.code(f"{c.get('file_path')}:{c.get('start_line')}")
+                            elif ans_resp.status_code == 401:
+                                logout_and_redirect("Session expired. Please log in again.")
                             else:
                                 st.error(ans_resp.text)
+                        except httpx.HTTPError as e:
+                            if hasattr(e, "response") and e.response is not None and e.response.status_code == 401:
+                                logout_and_redirect("Session expired. Please log in again.")
+                            else:
+                                st.error(f"Ask failed: {e}")
                         except Exception as e:
                             st.error(f"Ask failed: {e}")
             with ctx_col:
@@ -751,14 +795,20 @@ def show_project_details(project_id: str, get_auth_header):
                         st.warning("Enter an instruction")
                     else:
                         try:
-                            ctx_resp = httpx.post(
-                                f"{API_URL}/analysis/{project_id}/context",
-                                headers=get_auth_header(),
-                                json={"instruction": instruction, "priority": priority},
-                                timeout=10
-                            )
+                            with st.spinner("Adding context..."):
+                                ctx_resp = httpx.post(
+                                    f"{API_URL}/analysis/{project_id}/context",
+                                    headers=get_auth_header(),
+                                    json={"instruction": instruction, "priority": priority},
+                                    timeout=10
+                                )
                             ctx_resp.raise_for_status()
                             st.success("Context added")
+                        except httpx.HTTPError as e:
+                            if hasattr(e, "response") and e.response is not None and e.response.status_code == 401:
+                                logout_and_redirect("Session expired. Please log in again.")
+                            else:
+                                st.error(f"Add context failed: {e}")
                         except Exception as e:
                             st.error(f"Add context failed: {e}")
         
@@ -768,11 +818,12 @@ def show_project_details(project_id: str, get_auth_header):
             with d_cols[0]:
                 if st.button("Load Diagrams", use_container_width=True):
                     try:
-                        d_resp = httpx.get(
-                            f"{API_URL}/analysis/{project_id}/diagrams",
-                            headers=get_auth_header(),
-                            timeout=15
-                        )
+                        with st.spinner("Loading diagrams..."):
+                            d_resp = httpx.get(
+                                f"{API_URL}/analysis/{project_id}/diagrams",
+                                headers=get_auth_header(),
+                                timeout=15
+                            )
                         d_resp.raise_for_status()
                         diagrams = d_resp.json()
                         for title, code in diagrams.items():
@@ -785,12 +836,13 @@ def show_project_details(project_id: str, get_auth_header):
                 with e1:
                     if st.button("Export Markdown", use_container_width=True):
                         try:
-                            ex = httpx.get(
-                                f"{API_URL}/analysis/{project_id}/export",
-                                params={"format": "md"},
-                                headers=get_auth_header(),
-                                timeout=20
-                            )
+                            with st.spinner("Preparing markdown export..."):
+                                ex = httpx.get(
+                                    f"{API_URL}/analysis/{project_id}/export",
+                                    params={"format": "md"},
+                                    headers=get_auth_header(),
+                                    timeout=20
+                                )
                             ex.raise_for_status()
                             payload = ex.json()
                             content = payload.get("content", "")
@@ -806,12 +858,13 @@ def show_project_details(project_id: str, get_auth_header):
                 with e2:
                     if st.button("Export PDF (demo)", use_container_width=True):
                         try:
-                            ex = httpx.get(
-                                f"{API_URL}/analysis/{project_id}/export",
-                                params={"format": "pdf"},
-                                headers=get_auth_header(),
-                                timeout=20
-                            )
+                            with st.spinner("Preparing PDF export..."):
+                                ex = httpx.get(
+                                    f"{API_URL}/analysis/{project_id}/export",
+                                    params={"format": "pdf"},
+                                    headers=get_auth_header(),
+                                    timeout=20
+                                )
                             ex.raise_for_status()
                             payload = ex.json()
                             st.info(payload.get("note", "PDF export not available"))
@@ -847,11 +900,12 @@ def show_project_details(project_id: str, get_auth_header):
                     sde_tab_index = persona_tabs.index("SDE Analysis")
                     with persona_tab_objs[sde_tab_index]:
                         try:
-                            sde_resp = httpx.get(
-                                f"{API_URL}/analysis/{project_id}/persona-analysis/sde",
-                                headers=get_auth_header(),
-                                timeout=15
-                            )
+                            with st.spinner("Loading SDE analysis..."):
+                                sde_resp = httpx.get(
+                                    f"{API_URL}/analysis/{project_id}/persona-analysis/sde",
+                                    headers=get_auth_header(),
+                                    timeout=15
+                                )
                             sde_resp.raise_for_status()
                             sde_analysis = sde_resp.json()
                             
@@ -915,11 +969,12 @@ def show_project_details(project_id: str, get_auth_header):
                     pm_tab_index = persona_tabs.index("PM Analysis")
                     with persona_tab_objs[pm_tab_index]:
                         try:
-                            pm_resp = httpx.get(
-                                f"{API_URL}/analysis/{project_id}/persona-analysis/pm",
-                                headers=get_auth_header(),
-                                timeout=15
-                            )
+                            with st.spinner("Loading PM analysis..."):
+                                pm_resp = httpx.get(
+                                    f"{API_URL}/analysis/{project_id}/persona-analysis/pm",
+                                    headers=get_auth_header(),
+                                    timeout=15
+                                )
                             pm_resp.raise_for_status()
                             pm_analysis = pm_resp.json()
                             
@@ -1007,11 +1062,12 @@ def show_project_details(project_id: str, get_auth_header):
         # Code Chunks Section
         with st.expander("📦 Code Chunks", expanded=False):
             try:
-                chunks_resp = httpx.get(
-                    f"{API_URL}/analysis/{project_id}/chunks?limit=15",
-                    headers=get_auth_header(),
-                    timeout=10
-                )
+                with st.spinner("Loading code chunks..."):
+                    chunks_resp = httpx.get(
+                        f"{API_URL}/analysis/{project_id}/chunks?limit=15",
+                        headers=get_auth_header(),
+                        timeout=10
+                    )
                 chunks_resp.raise_for_status()
                 chunks_data = chunks_resp.json()
                 
@@ -1036,12 +1092,13 @@ def show_project_details(project_id: str, get_auth_header):
             
             if search_query:
                 try:
-                    search_resp = httpx.get(
-                        f"{API_URL}/analysis/{project_id}/search",
-                        params={"query": search_query, "limit": 10},
-                        headers=get_auth_header(),
-                        timeout=10
-                    )
+                    with st.spinner("Searching code..."):
+                        search_resp = httpx.get(
+                            f"{API_URL}/analysis/{project_id}/search",
+                            params={"query": search_query, "limit": 10},
+                            headers=get_auth_header(),
+                            timeout=10
+                        )
                     search_resp.raise_for_status()
                     search_data = search_resp.json()
                     
@@ -1062,7 +1119,12 @@ def show_project_details(project_id: str, get_auth_header):
                 except Exception as e:
                     st.error(f"Search failed: {e}")
     
-    except (httpx.HTTPError, Exception) as e:
+    except httpx.HTTPError as e:
+        if hasattr(e, "response") and e.response is not None and e.response.status_code == 401:
+            logout_and_redirect("Session expired. Please log in again.")
+        else:
+            st.error(f"Failed to load project: {e}")
+    except Exception as e:
         st.error(f"Failed to load project: {e}")
 
 
